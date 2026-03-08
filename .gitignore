@@ -1,0 +1,53 @@
+# Compiled executables
+*.exe
+*.out
+*.o
+*.a
+*.so
+*.dll
+
+# Dataset files (can be regenerated)
+datasets/*.txt
+!datasets/README.md
+
+# Result files
+results/*.txt
+results/*.csv
+results/*.png
+results/*.jpg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build directories
+build/
+bin/
+obj/
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Compiled Python files (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# CUDA compiled files
+*.cu.o
+*.ptx
+*.cubin
+
+# Backup files
+*.orig
+*.backup
+
+# OS specific
+Thumbs.db
+Desktop.ini
