@@ -16,23 +16,30 @@ typedef struct {
     int count;
 } Centroid;
 
-// Thread argument structure
 typedef struct {
     int thread_id;
     int start_idx;
     int end_idx;
     int local_changes;
-    double **local_centroid_coords; // Thread-local sums
-    int *local_centroid_counts;     // Thread-local counts
+    double **local_centroid_coords; 
+    int *local_centroid_counts;     
 } ThreadArg;
 
 // Global variables
 Point *points = NULL;
 Centroid *centroids = NULL;
+ThreadArg *global_thread_args = NULL; // Accessible by thread 0 for reduction
+
 int num_points = 0;
 int num_clusters = 0;
 int dimensions = 0;
-int num_threads = 4; // Default thread count
+int num_threads = 4; 
+
+// Synchronization and loop control variables
+pthread_barrier_t barrier;
+volatile int global_iteration = 0;
+volatile int global_total_changes = 0;
+int global_max_iterations = 0;
 
 // Function prototypes
 void read_data(const char *filename);
@@ -40,10 +47,8 @@ void initialize_centroids();
 double calculate_distance(double *p1, double *p2);
 void* worker_thread(void* arg);
 double calculate_wcss();
-void write_results(const char *output_file);
 void cleanup();
 
-// Read dataset from file (Same as serial)
 void read_data(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -70,7 +75,6 @@ void read_data(const char *filename) {
     fclose(fp);
 }
 
-// Initialize centroids (Same as serial)
 void initialize_centroids() {
     centroids = (Centroid *)malloc(num_clusters * sizeof(Centroid));
     for (int i = 0; i < num_clusters; i++) {
@@ -116,7 +120,6 @@ void initialize_centroids() {
     }
 }
 
-// Calculate Euclidean distance
 double calculate_distance(double *p1, double *p2) {
     double sum = 0.0;
     for (int d = 0; d < dimensions; d++) {
@@ -126,47 +129,6 @@ double calculate_distance(double *p1, double *p2) {
     return sqrt(sum);
 }
 
-// POSIX Worker Thread Function
-void* worker_thread(void* arg) {
-    ThreadArg *t_arg = (ThreadArg *)arg;
-    t_arg->local_changes = 0;
-
-    // Reset local centroid accumulators
-    for (int k = 0; k < num_clusters; k++) {
-        t_arg->local_centroid_counts[k] = 0;
-        for (int d = 0; d < dimensions; d++) {
-            t_arg->local_centroid_coords[k][d] = 0.0;
-        }
-    }
-
-    // Assign points to nearest cluster and accumulate local sums
-    for (int i = t_arg->start_idx; i < t_arg->end_idx; i++) {
-        double min_distance = DBL_MAX;
-        int nearest_cluster = 0;
-
-        for (int k = 0; k < num_clusters; k++) {
-            double distance = calculate_distance(points[i].coords, centroids[k].coords);
-            if (distance < min_distance) {
-                min_distance = distance;
-                nearest_cluster = k;
-            }
-        }
-
-        if (points[i].cluster_id != nearest_cluster) {
-            points[i].cluster_id = nearest_cluster;
-            t_arg->local_changes++;
-        }
-
-        // Add to local thread sums
-        t_arg->local_centroid_counts[nearest_cluster]++;
-        for (int d = 0; d < dimensions; d++) {
-            t_arg->local_centroid_coords[nearest_cluster][d] += points[i].coords[d];
-        }
-    }
-    return NULL;
-}
-
-// Calculate WCSS
 double calculate_wcss() {
     double wcss = 0.0;
     for (int i = 0; i < num_points; i++) {
@@ -179,7 +141,96 @@ double calculate_wcss() {
     return wcss;
 }
 
-// Cleanup memory
+// Persistent Worker Thread Function
+void* worker_thread(void* arg) {
+    ThreadArg *t_arg = (ThreadArg *)arg;
+    int id = t_arg->thread_id;
+
+    while (1) {
+        // 1. Check termination conditions
+        if (global_iteration >= global_max_iterations || global_total_changes == 0) {
+            break;
+        }
+
+        // 2. Reset local accumulators for this iteration
+        t_arg->local_changes = 0;
+        for (int k = 0; k < num_clusters; k++) {
+            t_arg->local_centroid_counts[k] = 0;
+            for (int d = 0; d < dimensions; d++) {
+                t_arg->local_centroid_coords[k][d] = 0.0;
+            }
+        }
+
+        // 3. Assign points to nearest cluster and accumulate locally
+        for (int i = t_arg->start_idx; i < t_arg->end_idx; i++) {
+            double min_distance = DBL_MAX;
+            int nearest_cluster = 0;
+
+            for (int k = 0; k < num_clusters; k++) {
+                double distance = calculate_distance(points[i].coords, centroids[k].coords);
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    nearest_cluster = k;
+                }
+            }
+
+            if (points[i].cluster_id != nearest_cluster) {
+                points[i].cluster_id = nearest_cluster;
+                t_arg->local_changes++;
+            }
+
+            t_arg->local_centroid_counts[nearest_cluster]++;
+            for (int d = 0; d < dimensions; d++) {
+                t_arg->local_centroid_coords[nearest_cluster][d] += points[i].coords[d];
+            }
+        }
+
+        // 4. Wait for all threads to finish their assignment phase
+        pthread_barrier_wait(&barrier);
+
+        // 5. Thread 0 performs the global reduction and updates condition variables
+        if (id == 0) {
+            global_total_changes = 0;
+            
+            // Reset global centroids
+            for (int k = 0; k < num_clusters; k++) {
+                centroids[k].count = 0;
+                for (int d = 0; d < dimensions; d++) centroids[k].coords[d] = 0.0;
+            }
+
+            // Reduce data from all thread local arrays
+            for (int t = 0; t < num_threads; t++) {
+                global_total_changes += global_thread_args[t].local_changes;
+                for (int k = 0; k < num_clusters; k++) {
+                    centroids[k].count += global_thread_args[t].local_centroid_counts[k];
+                    for (int d = 0; d < dimensions; d++) {
+                        centroids[k].coords[d] += global_thread_args[t].local_centroid_coords[k][d];
+                    }
+                }
+            }
+
+            // Finalize global centroid means
+            for (int k = 0; k < num_clusters; k++) {
+                if (centroids[k].count > 0) {
+                    for (int d = 0; d < dimensions; d++) {
+                        centroids[k].coords[d] /= centroids[k].count;
+                    }
+                }
+            }
+
+            global_iteration++;
+            if (global_iteration % 10 == 0 || global_total_changes == 0) {
+                double wcss = calculate_wcss();
+                printf("Iteration %d: WCSS = %.6f, Changes = %d\n", global_iteration, wcss, global_total_changes);
+            }
+        }
+
+        // 6. Wait for Thread 0 to finish updating globals before starting the next loop
+        pthread_barrier_wait(&barrier);
+    }
+    return NULL;
+}
+
 void cleanup() {
     if (points) {
         for (int i = 0; i < num_points; i++) free(points[i].coords);
@@ -199,96 +250,74 @@ int main(int argc, char *argv[]) {
 
     const char *input_file = argv[1];
     num_clusters = atoi(argv[2]);
-    int max_iterations = atoi(argv[3]);
+    global_max_iterations = atoi(argv[3]);
     num_threads = atoi(argv[4]);
 
     srand(42);
-    clock_t start_time = clock();
-
+    
     read_data(input_file);
     initialize_centroids();
 
-    // Prepare Thread Arguments and Structures
+    // Initialize the barrier
+    pthread_barrier_init(&barrier, NULL, num_threads);
+
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-    ThreadArg *thread_args = (ThreadArg *)malloc(num_threads * sizeof(ThreadArg));
+    global_thread_args = (ThreadArg *)malloc(num_threads * sizeof(ThreadArg));
     
     int chunk_size = num_points / num_threads;
     int remainder = num_points % num_threads;
 
     for (int i = 0; i < num_threads; i++) {
-        thread_args[i].thread_id = i;
-        thread_args[i].start_idx = i * chunk_size + (i < remainder ? i : remainder);
-        thread_args[i].end_idx = thread_args[i].start_idx + chunk_size + (i < remainder ? 1 : 0);
+        global_thread_args[i].thread_id = i;
+        global_thread_args[i].start_idx = i * chunk_size + (i < remainder ? i : remainder);
+        global_thread_args[i].end_idx = global_thread_args[i].start_idx + chunk_size + (i < remainder ? 1 : 0);
         
-        thread_args[i].local_centroid_coords = (double **)malloc(num_clusters * sizeof(double *));
+        global_thread_args[i].local_centroid_coords = (double **)malloc(num_clusters * sizeof(double *));
         for (int k = 0; k < num_clusters; k++) {
-            thread_args[i].local_centroid_coords[k] = (double *)malloc(dimensions * sizeof(double));
+            global_thread_args[i].local_centroid_coords[k] = (double *)malloc(dimensions * sizeof(double));
         }
-        thread_args[i].local_centroid_counts = (int *)malloc(num_clusters * sizeof(int));
+        global_thread_args[i].local_centroid_counts = (int *)malloc(num_clusters * sizeof(int));
     }
-
-    int iteration = 0;
-    int total_changes = num_points;
 
     printf("\nStarting K-Means iterations with %d POSIX threads...\n", num_threads);
 
-    while (iteration < max_iterations && total_changes > 0) {
-        total_changes = 0;
+    // Initialize loop conditions
+    global_iteration = 0;
+    global_total_changes = num_points;
 
-        // 1. Reset global centroids
-        for (int k = 0; k < num_clusters; k++) {
-            for (int d = 0; d < dimensions; d++) centroids[k].coords[d] = 0.0;
-            centroids[k].count = 0;
-        }
+    // Use clock_gettime for true wall-clock measurement
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        // 2. Spawn threads for assignment and local summation
-        for (int i = 0; i < num_threads; i++) {
-            pthread_create(&threads[i], NULL, worker_thread, (void *)&thread_args[i]);
-        }
-
-        // 3. Join threads and reduce (combine) results
-        for (int i = 0; i < num_threads; i++) {
-            pthread_join(threads[i], NULL);
-            total_changes += thread_args[i].local_changes;
-
-            for (int k = 0; k < num_clusters; k++) {
-                centroids[k].count += thread_args[i].local_centroid_counts[k];
-                for (int d = 0; d < dimensions; d++) {
-                    centroids[k].coords[d] += thread_args[i].local_centroid_coords[k][d];
-                }
-            }
-        }
-
-        // 4. Finalize global centroid means
-        for (int k = 0; k < num_clusters; k++) {
-            if (centroids[k].count > 0) {
-                for (int d = 0; d < dimensions; d++) {
-                    centroids[k].coords[d] /= centroids[k].count;
-                }
-            }
-        }
-
-        double wcss = calculate_wcss();
-        iteration++;
-        if (iteration % 10 == 0 || total_changes == 0) {
-            printf("Iteration %d: WCSS = %.6f, Changes = %d\n", iteration, wcss, total_changes);
-        }
+    // Spawn threads ONCE
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, (void *)&global_thread_args[i]);
     }
 
-    clock_t end_time = clock();
-    double elapsed_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
-    printf("\nConverged after %d iterations\nExecution time: %.6f seconds\n", iteration, elapsed_time);
+    // Wait for all threads to finish all iterations
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
 
-    // Cleanup POSIX specific memory
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    
+    // Calculate elapsed time in seconds
+    double elapsed_time = (end_time.tv_sec - start_time.tv_sec) + 
+                          (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+
+    printf("\nConverged after %d iterations\nExecution time: %.6f seconds\n", global_iteration, elapsed_time);
+
+    // Cleanup memory and barrier
+    pthread_barrier_destroy(&barrier);
     for (int i = 0; i < num_threads; i++) {
         for (int k = 0; k < num_clusters; k++) {
-            free(thread_args[i].local_centroid_coords[k]);
+            free(global_thread_args[i].local_centroid_coords[k]);
         }
-        free(thread_args[i].local_centroid_coords);
-        free(thread_args[i].local_centroid_counts);
+        free(global_thread_args[i].local_centroid_coords);
+        free(global_thread_args[i].local_centroid_counts);
     }
     free(threads);
-    free(thread_args);
+    free(global_thread_args);
     cleanup();
 
     return 0;
