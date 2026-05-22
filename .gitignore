@@ -51,3 +51,9 @@ __pycache__/
 # OS specific
 Thumbs.db
 Desktop.ini
+
+# Large dataset files 
+datasets/covertype_for_kmeans.txt
+datasets/covtype.data.gz
+datasets/kddcup*.gz
+datasets/kdd_*.txt
