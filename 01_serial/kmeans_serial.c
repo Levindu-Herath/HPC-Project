@@ -1,5 +1,3 @@
-// * Serial K-Means Clustering Implementation
- 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

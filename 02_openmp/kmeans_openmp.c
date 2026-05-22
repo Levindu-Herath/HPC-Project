@@ -1,8 +1,3 @@
-/*
- * Parallel K-Means using OpenMP
- * High Performance Computing Mini Project
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -191,7 +186,7 @@ void update_centroids_parallel()
     }
 }
 
-/* ================= WCSS (PARALLEL) ================= */
+/* ================= WCSS (PARALLEL) Within-Cluster Sum of Squares ================= */
 double calculate_wcss_parallel()
 {
     double wcss = 0.0;
