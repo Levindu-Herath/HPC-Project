@@ -36,7 +36,7 @@ void read_data_flat(const char *filename) {
     fclose(fp);
 }
 
-void initialize_centroids_cpu(double *points, double *centroids, int num_points, int num_clusters, int dims) {
+void init_centroids(double *points, double *centroids, int num_points, int num_clusters, int dims) {
     int first_idx = rand() % num_points;
     for (int d = 0; d < dims; d++) centroids[0 * dims + d] = points[first_idx * dims + d];
 
@@ -93,16 +93,15 @@ int main(int argc, char *argv[]) {
 
     double *global_centroids = NULL;
 
-    // Start timing BEFORE Rank 0 does the heavy initialization and reading
     MPI_Barrier(MPI_COMM_WORLD);
     double start_time = MPI_Wtime();
 
-    // 1. Rank 0 Reads Data and Initializes K-Means++
+    // Rank 0 Reads Data and Initializes K-Means++
     if (rank == 0) {
         srand(42); 
         read_data_flat(input_file);
         global_centroids = (double *)malloc(num_clusters * dimensions * sizeof(double));
-        initialize_centroids_cpu(global_points, global_centroids, global_num_points, num_clusters, dimensions);
+        init_centroids(global_points, global_centroids, global_num_points, num_clusters, dimensions);
         
         printf("\n==================================================\n");
         printf("[MPI] K-Means Clustering (Distributed Memory)\n");
@@ -112,7 +111,7 @@ int main(int argc, char *argv[]) {
         printf("--------------------------------------------------\n");
     }
 
-    // 2. Broadcast Dataset Metadata to all nodes
+    // Broadcast Dataset Metadata to all nodes
     MPI_Bcast(&global_num_points, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&dimensions, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -124,7 +123,7 @@ int main(int argc, char *argv[]) {
     // Broadcast the initial centroids to all nodes
     MPI_Bcast(global_centroids, num_clusters * dimensions, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // 3. Partition Data using MPI_Scatterv (handles uneven division of points)
+    // Partition Data using MPI_Scatterv (handles uneven division of points)
     int *sendcounts = (int *)malloc(size * sizeof(int));
     int *displs = (int *)malloc(size * sizeof(int));
     
@@ -160,7 +159,7 @@ int main(int argc, char *argv[]) {
     int global_changes = global_num_points;
     double global_wcss = 0.0;
 
-    // 4. Distributed K-Means Loop
+    // Distributed K-Means Loop
     while (iter < max_iter && global_changes > 0) {
         int local_changes = 0;
         
@@ -227,7 +226,7 @@ int main(int argc, char *argv[]) {
                     double diff = local_points[i * dimensions + d] - global_centroids[cid * dimensions + d];
                     dist += diff * diff;
                 }
-                local_wcss += dist; // squared distance for WCSS
+                local_wcss += dist; 
             }
             
             MPI_Reduce(&local_wcss, &global_wcss, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -243,7 +242,6 @@ int main(int argc, char *argv[]) {
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
 
-    // 5. Final Output
     if (rank == 0) {
         double final_rmse = sqrt(global_wcss / global_num_points);
         printf("--------------------------------------------------\n");
